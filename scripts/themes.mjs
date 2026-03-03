@@ -1,55 +1,49 @@
 #!/usr/bin/env node
 
-import { execSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { readdirSync, readFileSync } from 'fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const skillRoot = join(__dirname, '..');
+const themesDir = join(__dirname, '..', 'assets', 'themes');
 
-async function loadBeautifulMermaid() {
-  try {
-    return await import('beautiful-mermaid');
-  } catch {}
+function main() {
+  const files = readdirSync(themesDir)
+    .filter(f => f.endsWith('.json'))
+    .sort();
 
-  console.error('[beautiful-mermaid] Dependency not found. Installing automatically...');
-  try {
-    execSync('npm install --no-fund --no-audit', {
-      cwd: skillRoot,
-      stdio: ['pipe', 'pipe', 'inherit'],
-      timeout: 120000,
-    });
-    console.error('[beautiful-mermaid] Installed successfully.\n');
-  } catch (e) {
-    console.error(`[beautiful-mermaid] Auto-install failed: ${e.message}`);
-    console.error(`Manual fix: cd ${skillRoot} && npm install`);
-    process.exit(1);
+  console.log('Available Themes:\n');
+
+  for (let i = 0; i < files.length; i++) {
+    const name = files[i].replace('.json', '');
+    const config = JSON.parse(readFileSync(join(themesDir, files[i]), 'utf8'));
+    const vars = config.themeVariables || {};
+
+    const bg = vars.background || '?';
+    const fg = vars.primaryTextColor || vars.textColor || '?';
+    const line = vars.lineColor || '?';
+    const isDark = isDarkColor(bg);
+
+    const label = `${String(i + 1).padStart(2)}. ${name.padEnd(20)}`;
+    const colors = `bg:${bg}  fg:${fg}  line:${line}`;
+    const mode = isDark ? 'dark' : 'light';
+
+    console.log(`${label} ${colors}  [${mode}]`);
   }
 
-  try {
-    const pkgPath = join(skillRoot, 'node_modules', 'beautiful-mermaid', 'dist', 'index.js');
-    return await import(pkgPath);
-  } catch (e) {
-    console.error(`[beautiful-mermaid] Failed to load after install: ${e.message}`);
-    process.exit(1);
-  }
-}
-
-async function main() {
-  const { THEMES } = await loadBeautifulMermaid();
-  const themes = Object.keys(THEMES);
-
-  console.log('Available Beautiful-Mermaid Themes:\n');
-  themes.forEach((theme, i) => {
-    console.log(`${String(i + 1).padStart(2)}. ${theme}`);
-  });
-
-  console.log(`\nTotal: ${themes.length} themes`);
+  console.log(`\nTotal: ${files.length} themes`);
   console.log('\nUsage:');
   console.log('  node scripts/render.mjs --input diagram.mmd --theme <theme-name> --output output.svg');
+  console.log('  node scripts/render.mjs --input diagram.mmd --theme <theme-name> --format png --output output.png');
 }
 
-main().catch(e => {
-  console.error('Error:', e.message);
-  process.exit(1);
-});
+function isDarkColor(hex) {
+  if (!hex || !hex.startsWith('#')) return true;
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  // Relative luminance (sRGB)
+  return (0.299 * r + 0.587 * g + 0.114 * b) < 128;
+}
+
+main();

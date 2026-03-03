@@ -3,38 +3,13 @@
 import { execSync } from 'child_process';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const skillRoot = join(__dirname, '..');
-
-async function loadBeautifulMermaid() {
-  try {
-    return await import('beautiful-mermaid');
-  } catch {}
-
-  console.error('[beautiful-mermaid] Dependency not found. Installing automatically...');
-  try {
-    execSync('npm install --no-fund --no-audit', {
-      cwd: skillRoot,
-      stdio: ['pipe', 'pipe', 'inherit'],
-      timeout: 120000,
-    });
-    console.error('[beautiful-mermaid] Installed successfully.\n');
-  } catch (e) {
-    console.error(`[beautiful-mermaid] Auto-install failed: ${e.message}`);
-    console.error(`Manual fix: cd ${skillRoot} && npm install`);
-    process.exit(1);
-  }
-
-  try {
-    const pkgPath = join(skillRoot, 'node_modules', 'beautiful-mermaid', 'dist', 'index.js');
-    return await import(pkgPath);
-  } catch (e) {
-    console.error(`[beautiful-mermaid] Failed to load after install: ${e.message}`);
-    process.exit(1);
-  }
-}
+const themesDir = join(skillRoot, 'assets', 'themes');
+const fontsCSS = join(skillRoot, 'assets', 'fonts.css');
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -43,10 +18,11 @@ function parseArgs() {
     outputDir: null,
     format: 'svg',
     theme: null,
+    scale: 2,
+    width: 1200,
     bg: null,
     fg: null,
     transparent: false,
-    useAscii: false,
     workers: 4,
   };
 
@@ -59,24 +35,28 @@ function parseArgs() {
       case '--output-dir': case '-o': opts.outputDir = val; i++; break;
       case '--format': case '-f': opts.format = val; i++; break;
       case '--theme': case '-t': opts.theme = val; i++; break;
+      case '--scale': case '-s': opts.scale = parseInt(val); i++; break;
+      case '--width': case '-w': opts.width = parseInt(val); i++; break;
       case '--bg': opts.bg = val; i++; break;
       case '--fg': opts.fg = val; i++; break;
       case '--transparent': opts.transparent = true; break;
-      case '--use-ascii': opts.useAscii = true; break;
-      case '--workers': case '-w': opts.workers = parseInt(val); i++; break;
+      case '--workers': opts.workers = parseInt(val); i++; break;
       case '--help': case '-h':
         console.log(`Usage: node batch.mjs --input-dir <dir> --output-dir <dir> [options]
 
 Options:
   -i, --input-dir <dir>    Input directory containing .mmd files [required]
   -o, --output-dir <dir>   Output directory for rendered files [required]
-  -f, --format <fmt>       Output format: svg | ascii (default: svg)
+  -f, --format <fmt>       Output format: svg | png (default: svg)
   -t, --theme <name>       Theme name (e.g. tokyo-night, dracula)
-      --bg <hex>           Background color
-      --fg <hex>           Foreground color
-      --transparent        Transparent background (SVG only)
-      --use-ascii          Pure ASCII instead of Unicode (ASCII only)
-  -w, --workers <n>        Parallel workers (default: 4)`);
+  -s, --scale <n>          PNG scale factor (default: 2)
+  -w, --width <n>          Max width in pixels (default: 1200)
+      --bg <hex>           Override background color
+      --fg <hex>           Override text color
+      --transparent        Transparent background
+      --workers <n>        Max parallel renders (default: 4)
+
+Themes: engineering, tokyo-night, catppuccin-mocha, nord, dracula, github-dark, github-light, solarized-dark, one-dark`);
         process.exit(0);
     }
   }
@@ -97,40 +77,186 @@ Options:
   return opts;
 }
 
-async function renderFile(file, inputDir, outputDir, opts, lib) {
-  const { renderMermaid, renderMermaidAscii, THEMES } = lib;
-  const inputPath = join(inputDir, file);
-  const ext = opts.format === 'svg' ? '.svg' : '.txt';
-  const outputPath = join(outputDir, file.replace(/\.mmd$/, ext));
-  const input = readFileSync(inputPath, 'utf8');
-
-  if (opts.format === 'ascii') {
-    const ascii = renderMermaidAscii(input, { useAscii: opts.useAscii });
-    writeFileSync(outputPath, ascii);
+function buildConfig(opts) {
+  let config;
+  if (opts.theme) {
+    const themeFile = join(themesDir, `${opts.theme}.json`);
+    if (!existsSync(themeFile)) {
+      const available = readdirSync(themesDir)
+        .filter(f => f.endsWith('.json'))
+        .map(f => f.replace('.json', ''));
+      console.error(`Error: Unknown theme "${opts.theme}". Available: ${available.join(', ')}`);
+      process.exit(1);
+    }
+    config = JSON.parse(readFileSync(themeFile, 'utf8'));
   } else {
-    const theme = opts.theme ? THEMES[opts.theme] : undefined;
-    const colors = theme || {
-      ...(opts.bg && { bg: opts.bg }),
-      ...(opts.fg && { fg: opts.fg }),
+    config = {
+      theme: 'base',
+      themeVariables: {
+        fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, sans-serif',
+        fontSize: '14px',
+      },
+      flowchart: { curve: 'basis', padding: 20 },
     };
+  }
 
-    const svg = await renderMermaid(input, {
-      ...colors,
-      transparent: opts.transparent,
-    });
-    writeFileSync(outputPath, svg);
+  if (opts.bg) config.themeVariables.background = opts.bg;
+  if (opts.fg) {
+    config.themeVariables.primaryTextColor = opts.fg;
+    config.themeVariables.textColor = opts.fg;
+    config.themeVariables.nodeTextColor = opts.fg;
+  }
+
+  return config;
+}
+
+function renderFile(file, inputDir, outputDir, opts, tmpConfig) {
+  const inputPath = join(inputDir, file);
+  const ext = opts.format === 'png' ? '.png' : '.svg';
+  const outputPath = join(outputDir, file.replace(/\.mmd$/, ext));
+
+  const mmdcArgs = [
+    '-i', inputPath,
+    '-o', outputPath,
+    '-c', tmpConfig,
+  ];
+
+  if (existsSync(fontsCSS)) {
+    mmdcArgs.push('--cssFile', fontsCSS);
+  }
+
+  if (opts.transparent) {
+    mmdcArgs.push('-b', 'transparent');
+  }
+
+  if (opts.format === 'png') {
+    mmdcArgs.push('-s', String(opts.scale));
+  }
+
+  mmdcArgs.push('-w', String(opts.width));
+
+  const cmd = ['mmdc', ...mmdcArgs.map(a => `"${a}"`)].join(' ');
+  execSync(cmd, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: 60000,
+  });
+
+  // Post-process SVG for vector editor compatibility (Inkscape/Illustrator)
+  if (opts.format === 'svg') {
+    postProcessSvg(outputPath);
   }
 }
 
-async function main() {
+/**
+ * Comprehensive SVG post-processing for vector editor compatibility.
+ *
+ * Fixes three classes of issues:
+ * 1. foreignObject → native <text>: Inkscape/Illustrator silently drop HTML in foreignObject
+ * 2. Background rect injection: SVG CSS background-color is ignored by standalone SVG viewers
+ * 3. Edge label opacity: mermaid hardcodes opacity:0.5 on label backgrounds, creating ghost boxes
+ */
+function postProcessSvg(svgPath) {
+  let svg = readFileSync(svgPath, 'utf8');
+  const stats = { foreignObjects: 0, bgRect: false, opacityFixes: 0 };
+
+  // --- Extract theme colors from SVG CSS ---
+  const bgMatch = svg.match(/background-color:\s*rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  const bgColor = bgMatch
+    ? `#${[bgMatch[1], bgMatch[2], bgMatch[3]].map(c => parseInt(c).toString(16).padStart(2, '0')).join('')}`
+    : null;
+
+  const fillMatch = svg.match(/#my-svg\{[^}]*fill:([^;}]+)/);
+  const textFill = fillMatch ? fillMatch[1].trim() : '#1a1a1a';
+
+  const fontMatch = svg.match(/#my-svg\{[^}]*font-family:([^;}]+)/);
+  const fontFamily = fontMatch ? fontMatch[1].trim() : 'Inter, system-ui, sans-serif';
+
+  // --- Fix 1: Inject background <rect> ---
+  if (bgColor) {
+    const vbMatch = svg.match(/viewBox="([^"]+)"/);
+    if (vbMatch) {
+      const [vbX, vbY, vbW, vbH] = vbMatch[1].split(/\s+/).map(Number);
+      const bgRectEl = `<rect x="${vbX}" y="${vbY}" width="${vbW}" height="${vbH}" fill="${bgColor}" stroke="none"/>`;
+      svg = svg.replace(/(<g><marker )/, `${bgRectEl}$1`);
+      stats.bgRect = true;
+    }
+  }
+
+  // --- Fix 2: Override edge label rect opacity from 0.5 to 1 ---
+  const opacityBefore = (svg.match(/opacity:0\.5/g) || []).length;
+  svg = svg.replace(
+    /\.edgeLabel rect\{opacity:0\.5;/g,
+    '.edgeLabel rect{opacity:1;'
+  );
+  svg = svg.replace(
+    /\.icon-shape rect,#my-svg \.image-shape rect\{opacity:0\.5/g,
+    '.icon-shape rect,#my-svg .image-shape rect{opacity:1'
+  );
+  const opacityAfter = (svg.match(/opacity:0\.5/g) || []).length;
+  stats.opacityFixes = opacityBefore - opacityAfter;
+
+  // --- Fix 3: Convert foreignObject to native SVG <text> ---
+  const originalFOCount = (svg.match(/<foreignObject/g) || []).length;
+
+  svg = svg.replace(
+    /<foreignObject\s+width="([^"]*?)"\s+height="([^"]*?)">([\s\S]*?)<\/foreignObject>/g,
+    (match, width, height, inner) => {
+      const lines = inner
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/p>\s*<p>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0);
+
+      if (lines.length === 0) {
+        return `<rect width="${width}" height="${height}" fill="none" stroke="none"/>`;
+      }
+
+      const w = parseFloat(width);
+      const h = parseFloat(height);
+      const lineHeight = 1.4;
+      const fontSize = 14;
+      const totalTextHeight = lines.length * fontSize * lineHeight;
+      const startY = (h - totalTextHeight) / 2 + fontSize;
+
+      const tspans = lines.map((line, i) => {
+        const y = startY + i * fontSize * lineHeight;
+        return `<tspan x="${w / 2}" y="${y}">${escapeXml(line)}</tspan>`;
+      }).join('');
+
+      return `<text text-anchor="middle" dominant-baseline="auto" fill="${textFill}" style="font-size:${fontSize}px;font-family:${fontFamily};">${tspans}</text>`;
+    }
+  );
+
+  stats.foreignObjects = originalFOCount - (svg.match(/<foreignObject/g) || []).length;
+
+  writeFileSync(svgPath, svg);
+  return stats;
+}
+
+function escapeXml(str) {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function main() {
   const opts = parseArgs();
-  const lib = await loadBeautifulMermaid();
+  const config = buildConfig(opts);
 
   mkdirSync(opts.outputDir, { recursive: true });
+
+  // Write shared temp config
+  const tmpConfig = join(tmpdir(), `mermaid-batch-config-${Date.now()}.json`);
+  writeFileSync(tmpConfig, JSON.stringify(config, null, 2));
 
   const files = readdirSync(opts.inputDir).filter(f => f.endsWith('.mmd'));
   if (files.length === 0) {
     console.error(`No .mmd files found in ${opts.inputDir}`);
+    try { unlinkSync(tmpConfig); } catch {}
     process.exit(1);
   }
 
@@ -139,24 +265,19 @@ async function main() {
   let success = 0;
   const failed = [];
 
-  // Process in batches of `workers` size
-  for (let i = 0; i < files.length; i += opts.workers) {
-    const batch = files.slice(i, i + opts.workers);
-    const results = await Promise.allSettled(
-      batch.map(file => renderFile(file, opts.inputDir, opts.outputDir, opts, lib))
-    );
-
-    results.forEach((result, idx) => {
-      const file = batch[idx];
-      if (result.status === 'fulfilled') {
-        console.log(`\u2713 ${file}`);
-        success++;
-      } else {
-        console.error(`\u2717 ${file}: ${result.reason?.message || result.reason}`);
-        failed.push([file, result.reason?.message || String(result.reason)]);
-      }
-    });
+  for (const file of files) {
+    try {
+      renderFile(file, opts.inputDir, opts.outputDir, opts, tmpConfig);
+      console.log(`\u2713 ${file}`);
+      success++;
+    } catch (e) {
+      const msg = e.stderr ? e.stderr.toString().trim() : e.message;
+      console.error(`\u2717 ${file}: ${msg}`);
+      failed.push([file, msg]);
+    }
   }
+
+  try { unlinkSync(tmpConfig); } catch {}
 
   console.log(`\n${success}/${files.length} diagrams rendered successfully`);
 
@@ -169,7 +290,4 @@ async function main() {
   }
 }
 
-main().catch(e => {
-  console.error('Error:', e.message);
-  process.exit(1);
-});
+main();
