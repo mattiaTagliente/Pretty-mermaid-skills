@@ -351,7 +351,7 @@ Create a JSON file in `SKILL_ROOT/assets/themes/<name>.json`:
     "titleColor": "#000000",
     "edgeLabelBackground": "#ffffff",
     "fontFamily": "Inter, system-ui, sans-serif",
-    "fontSize": "14px"
+    "fontSize": "18px"
   },
   "flowchart": { "curve": "basis", "padding": 20 }
 }
@@ -542,6 +542,25 @@ After every PNG render, you MUST:
 3. **Only after passing both checks**, keep the PNG. Otherwise fix the .mmd
    source and re-render.
 
+4. **Final render with PDF**: once the QA loop passes, re-render with `--pdf` to
+   produce the final vector PDF alongside SVG and PNG:
+   ```bash
+   node "SKILL_ROOT/scripts/render.mjs" \
+     --input diagram.mmd \
+     --output diagram.png \
+     --format png \
+     --theme engineering \
+     --scale 3 \
+     --pdf
+   ```
+   This produces `diagram.svg` (post-processed), `diagram.png`, and `diagram.pdf`
+   (vector, matching the SVG viewBox dimensions).
+
 This gate is non-negotiable. Prior failures: `\n` instead of `<br/>` rendered
 as literal text, diagrams too complex to read at page width, visual errors
 undetected because the agent never opened the rendered PNG.
+
+**Pipeline note**: PNG output always goes through SVG post-processing first
+(text conversion, edge label shifts, opacity fixes), so the PNG faithfully
+reflects the final SVG. The `--pdf` flag generates a tight-fit vector PDF from
+the same processed SVG.

@@ -20,7 +20,7 @@
     "noteBorderColor": "#d0d7de",
     "noteTextColor": "#1f2328",
     "fontFamily": "Inter, system-ui, -apple-system, Segoe UI, sans-serif",
-    "fontSize": "14px"
+    "fontSize": "18px"
   },
   "flowchart": { "curve": "basis", "padding": 20, "htmlLabels": false }
 }

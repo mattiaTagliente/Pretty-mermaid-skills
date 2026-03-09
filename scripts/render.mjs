@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execSync } from 'child_process';
+import { createRequire } from 'module';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync, readdirSync } from 'fs';
@@ -30,6 +31,7 @@ function parseArgs() {
     paddingX: 5,
     paddingY: 5,
     boxBorderPadding: 1,
+    pdf: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -48,6 +50,7 @@ function parseArgs() {
       case '--line': opts.line = val; i++; break;
       case '--font': opts.font = val; i++; break;
       case '--transparent': opts.transparent = true; break;
+      case '--pdf': opts.pdf = true; break;
       case '--use-ascii': opts.useAscii = true; break;
       case '--padding-x': opts.paddingX = parseInt(val); i++; break;
       case '--padding-y': opts.paddingY = parseInt(val); i++; break;
@@ -67,6 +70,7 @@ Options:
       --line <hex>         Override edge/connector color
       --font <name>        Override font family (default: Inter)
       --transparent        Transparent background
+      --pdf               Also generate PDF from the processed SVG (vector output)
       --use-ascii          Pure ASCII instead of Unicode (ASCII only)
       --padding-x <n>      Horizontal spacing (ASCII only, default: 5)
       --padding-y <n>      Vertical spacing (ASCII only, default: 5)
@@ -110,7 +114,7 @@ function buildMmdcConfig(opts) {
       theme: 'base',
       themeVariables: {
         fontFamily: 'Inter, system-ui, -apple-system, Segoe UI, sans-serif',
-        fontSize: '14px',
+        fontSize: '18px',
       },
       flowchart: { curve: 'basis', padding: 20 },
     };
@@ -129,70 +133,158 @@ function buildMmdcConfig(opts) {
   return config;
 }
 
-function renderWithMmdc(opts) {
+/**
+ * Resolve puppeteer from mmdc's global installation (avoids adding ~200MB dependency).
+ */
+let _puppeteer = null;
+function loadPuppeteer() {
+  if (_puppeteer) return _puppeteer;
+  const npmRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+  const mmdcEntry = join(npmRoot, '@mermaid-js', 'mermaid-cli', 'src', 'index.js');
+  const mmdcRequire = createRequire(mmdcEntry);
+  _puppeteer = mmdcRequire('puppeteer');
+  return _puppeteer;
+}
+
+/**
+ * Build an HTML wrapper that renders the SVG at its natural viewBox dimensions.
+ * Removes the max-width constraint so Puppeteer captures at full size.
+ */
+function buildSvgHtml(svgContent, vbW, vbH) {
+  const fixed = svgContent
+    .replace(/width="100%"/, `width="${vbW}" height="${vbH}"`)
+    .replace(/max-width:\s*[\d.]+px;\s*/, '');
+  return `<!DOCTYPE html><html><head><style>body{margin:0;padding:0;overflow:hidden}svg{display:block}</style></head><body>${fixed}</body></html>`;
+}
+
+function parseSvgViewBox(svgContent) {
+  const m = svgContent.match(/viewBox="([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)\s+([\d.+-]+)"/);
+  if (!m) throw new Error('SVG missing viewBox dimensions');
+  return { minX: parseFloat(m[1]), minY: parseFloat(m[2]), w: parseFloat(m[3]), h: parseFloat(m[4]) };
+}
+
+/**
+ * Convert a post-processed SVG to PNG via Puppeteer.
+ * Uses deviceScaleFactor for crisp high-DPI output.
+ */
+async function svgToPng(svgPath, pngPath, scale = 2) {
+  const puppeteer = loadPuppeteer();
+  const svgContent = readFileSync(svgPath, 'utf8');
+  const vb = parseSvgViewBox(svgContent);
+  const w = Math.ceil(vb.w);
+  const h = Math.ceil(vb.h);
+
+  const tmpHtml = join(tmpdir(), `mermaid-png-${Date.now()}.html`);
+  writeFileSync(tmpHtml, buildSvgHtml(svgContent, w, h));
+
+  const browser = await puppeteer.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: scale });
+    await page.goto(`file:///${tmpHtml.replace(/\\/g, '/')}`, { waitUntil: 'networkidle0' });
+    await page.screenshot({ path: pngPath, fullPage: true, omitBackground: false });
+  } finally {
+    await browser.close();
+    try { unlinkSync(tmpHtml); } catch {}
+  }
+}
+
+/**
+ * Convert a post-processed SVG to PDF via Puppeteer.
+ * Page dimensions match the SVG viewBox for a tight-fit vector PDF.
+ */
+async function svgToPdf(svgPath, pdfPath) {
+  const puppeteer = loadPuppeteer();
+  const svgContent = readFileSync(svgPath, 'utf8');
+  const vb = parseSvgViewBox(svgContent);
+  const w = Math.ceil(vb.w);
+  const h = Math.ceil(vb.h);
+
+  const tmpHtml = join(tmpdir(), `mermaid-pdf-${Date.now()}.html`);
+  writeFileSync(tmpHtml, buildSvgHtml(svgContent, w, h));
+
+  const browser = await puppeteer.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.goto(`file:///${tmpHtml.replace(/\\/g, '/')}`, { waitUntil: 'networkidle0' });
+    await page.pdf({
+      path: pdfPath,
+      width: `${w}px`,
+      height: `${h}px`,
+      printBackground: true,
+      margin: { top: '0', right: '0', bottom: '0', left: '0' },
+    });
+  } finally {
+    await browser.close();
+    try { unlinkSync(tmpHtml); } catch {}
+  }
+}
+
+function printStats(stats) {
+  if (stats.foreignObjects > 0) console.log(`Converted ${stats.foreignObjects} foreignObject elements to native SVG text`);
+  if (stats.bgRect) console.log(`Injected background rect`);
+  if (stats.opacityFixes > 0) console.log(`Fixed ${stats.opacityFixes} semi-transparent label backgrounds`);
+  if (stats.edgeLabelShifts > 0) console.log(`Shifted ${stats.edgeLabelShifts} horizontal edge labels above edge paths`);
+}
+
+/**
+ * Main rendering pipeline.
+ * Always renders SVG first via mmdc, post-processes it, then converts
+ * to PNG and/or PDF as requested. This ensures all outputs reflect
+ * the same post-processing (text conversion, label shifts, opacity fixes).
+ */
+async function renderWithMmdc(opts) {
   const config = buildMmdcConfig(opts);
 
   // Write temp config
   const tmpConfig = join(tmpdir(), `mermaid-config-${Date.now()}.json`);
   writeFileSync(tmpConfig, JSON.stringify(config, null, 2));
 
-  // Determine output path
-  const ext = opts.format === 'png' ? '.png' : '.svg';
-  const output = opts.output || opts.input.replace(/\.mmd$/, ext);
+  // Determine output paths — all derived from the same base name
+  const baseName = opts.output
+    ? opts.output.replace(/\.(svg|png|pdf)$/i, '')
+    : opts.input.replace(/\.mmd$/, '');
+  const svgOutput = baseName + '.svg';
 
   // Ensure output directory exists
-  const outputDir = dirname(resolve(output));
+  const outputDir = dirname(resolve(svgOutput));
   mkdirSync(outputDir, { recursive: true });
 
-  // Build mmdc args
-  const mmdcArgs = [
-    '-i', opts.input,
-    '-o', output,
-    '-c', tmpConfig,
-  ];
-
-  if (existsSync(fontsCSS)) {
-    mmdcArgs.push('--cssFile', fontsCSS);
-  }
-
-  if (opts.transparent) {
-    mmdcArgs.push('-b', 'transparent');
-  } else if (config.themeVariables.background) {
-    mmdcArgs.push('-b', config.themeVariables.background);
-  }
-
-  if (opts.format === 'png') {
-    mmdcArgs.push('-s', String(opts.scale));
-  }
-
+  // Step 1: Render to SVG via mmdc (always SVG, even for PNG/PDF targets)
+  const mmdcArgs = ['-i', opts.input, '-o', svgOutput, '-c', tmpConfig];
+  if (existsSync(fontsCSS)) mmdcArgs.push('--cssFile', fontsCSS);
+  if (opts.transparent) mmdcArgs.push('-b', 'transparent');
+  else if (config.themeVariables.background) mmdcArgs.push('-b', config.themeVariables.background);
   mmdcArgs.push('-w', String(opts.width));
 
-  // Build command string with proper quoting
   const cmd = ['mmdc', ...mmdcArgs.map(a => `"${a}"`)].join(' ');
 
   try {
-    execSync(cmd, {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 60000,
-    });
-
-    // Post-process SVG for vector editor compatibility (Inkscape/Illustrator)
-    if (opts.format === 'svg') {
-      const stats = postProcessSvg(output);
-      if (stats.foreignObjects > 0) {
-        console.log(`Converted ${stats.foreignObjects} foreignObject elements to native SVG text`);
-      }
-      if (stats.bgRect) console.log(`Injected background rect`);
-      if (stats.opacityFixes > 0) console.log(`Fixed ${stats.opacityFixes} semi-transparent label backgrounds`);
-    }
-
-    console.log(`${opts.format.toUpperCase()} diagram saved to ${output}`);
+    execSync(cmd, { stdio: ['pipe', 'pipe', 'pipe'], timeout: 60000 });
   } catch (e) {
-    const stderr = e.stderr ? e.stderr.toString() : e.message;
-    console.error(`Error rendering diagram: ${stderr}`);
+    console.error(`Error rendering diagram: ${e.stderr ? e.stderr.toString() : e.message}`);
     process.exit(1);
   } finally {
     try { unlinkSync(tmpConfig); } catch {}
+  }
+
+  // Step 2: Post-process SVG (text conversion, opacity fix, edge label shift)
+  const stats = postProcessSvg(svgOutput);
+  printStats(stats);
+  console.log(`SVG diagram saved to ${svgOutput}`);
+
+  // Step 3: Convert to PNG from the processed SVG
+  if (opts.format === 'png') {
+    const pngOutput = baseName + '.png';
+    await svgToPng(svgOutput, pngOutput, opts.scale);
+    console.log(`PNG diagram saved to ${pngOutput}`);
+  }
+
+  // Step 4: Convert to PDF from the processed SVG
+  if (opts.pdf) {
+    const pdfOutput = baseName + '.pdf';
+    await svgToPdf(svgOutput, pdfOutput);
+    console.log(`PDF diagram saved to ${pdfOutput}`);
   }
 }
 
@@ -206,9 +298,9 @@ function renderWithMmdc(opts) {
  */
 function postProcessSvg(svgPath) {
   let svg = readFileSync(svgPath, 'utf8');
-  const stats = { foreignObjects: 0, bgRect: false, opacityFixes: 0 };
+  const stats = { foreignObjects: 0, bgRect: false, opacityFixes: 0, edgeLabelShifts: 0 };
 
-  // --- Extract theme colors from SVG CSS ---
+  // --- Extract theme colors and font size from SVG CSS ---
   const bgMatch = svg.match(/background-color:\s*rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
   const bgColor = bgMatch
     ? `#${[bgMatch[1], bgMatch[2], bgMatch[3]].map(c => parseInt(c).toString(16).padStart(2, '0')).join('')}`
@@ -219,6 +311,9 @@ function postProcessSvg(svgPath) {
 
   const fontMatch = svg.match(/#my-svg\{[^}]*font-family:([^;}]+)/);
   const fontFamily = fontMatch ? fontMatch[1].trim() : 'Inter, system-ui, sans-serif';
+
+  const fontSizeMatch = svg.match(/#my-svg\{[^}]*font-size:\s*(\d+(?:\.\d+)?)px/);
+  const fontSize = fontSizeMatch ? parseFloat(fontSizeMatch[1]) : 18;
 
   // --- Fix 1: Inject background <rect> ---
   // SVG CSS background-color is not rendered by Inkscape/Illustrator/standalone viewers.
@@ -270,7 +365,6 @@ function postProcessSvg(svgPath) {
       const w = parseFloat(width);
       const h = parseFloat(height);
       const lineHeight = 1.4;
-      const fontSize = 14;
       const totalTextHeight = lines.length * fontSize * lineHeight;
       const startY = (h - totalTextHeight) / 2 + fontSize;
 
@@ -286,6 +380,38 @@ function postProcessSvg(svgPath) {
 
   stats.foreignObjects = originalFOCount - (svg.match(/<foreignObject/g) || []).length;
 
+  // --- Fix 4: Shift horizontal edge labels above the edge path ---
+  // Extract edge path directions from the edgePaths section
+  const edgePathDirs = [];
+  const edgePathSection = svg.match(/class="edgePaths"[\s\S]*?(?=class="edgeLabels"|class="nodes"|$)/);
+  if (edgePathSection) {
+    const pathRegex = /<path[^>]*\bd="([^"]+)"[^>]*>/g;
+    let pm;
+    while ((pm = pathRegex.exec(edgePathSection[0])) !== null) {
+      edgePathDirs.push(isHorizontalPath(pm[1]));
+    }
+  }
+
+  if (edgePathDirs.length > 0) {
+    let labelIdx = 0;
+    const labelOffset = Math.round(fontSize * 0.85);
+    svg = svg.replace(
+      /<g\b[^>]*\bclass="edgeLabel"[^>]*>/g,
+      (tag) => {
+        const isHoriz = labelIdx < edgePathDirs.length ? edgePathDirs[labelIdx] : false;
+        labelIdx++;
+        if (!isHoriz) return tag;
+        return tag.replace(
+          /translate\(([^,)]+)[,\s]+([^)]+)\)/,
+          (_, xStr, yStr) => {
+            stats.edgeLabelShifts++;
+            return `translate(${xStr}, ${parseFloat(yStr) - labelOffset})`;
+          }
+        );
+      }
+    );
+  }
+
   writeFileSync(svgPath, svg);
   return stats;
 }
@@ -296,6 +422,34 @@ function escapeXml(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/**
+ * Extract start and end coordinates from an SVG path d-attribute.
+ * Handles M, L, C, Q commands by taking first M and last coordinate pair.
+ */
+function getPathEndpoints(d) {
+  const mMatch = d.match(/M\s*([-+]?\d*\.?\d+)[,\s]+([-+]?\d*\.?\d+)/);
+  if (!mMatch) return null;
+  const start = { x: parseFloat(mMatch[1]), y: parseFloat(mMatch[2]) };
+  const nums = [...d.matchAll(/([-+]?\d*\.?\d+)/g)].map(m => parseFloat(m[1]));
+  if (nums.length < 4) return null;
+  const end = { x: nums[nums.length - 2], y: nums[nums.length - 1] };
+  return { start, end };
+}
+
+/**
+ * Determine whether an SVG path is predominantly horizontal.
+ * Returns true if the angle between start and end points is within
+ * thresholdDeg of the horizontal axis.
+ */
+function isHorizontalPath(d, thresholdDeg = 60) {
+  const ep = getPathEndpoints(d);
+  if (!ep) return false;
+  const dx = Math.abs(ep.end.x - ep.start.x);
+  const dy = Math.abs(ep.end.y - ep.start.y);
+  if (dx === 0 && dy === 0) return false;
+  return Math.atan2(dy, dx) * (180 / Math.PI) <= thresholdDeg;
 }
 
 async function renderAscii(opts) {
@@ -331,7 +485,7 @@ async function main() {
   if (opts.format === 'ascii') {
     await renderAscii(opts);
   } else {
-    renderWithMmdc(opts);
+    await renderWithMmdc(opts);
   }
 }
 
